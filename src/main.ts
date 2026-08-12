@@ -1,3 +1,41 @@
+/**
+ * @module main
+ *
+ * Application entry point.  Initialises the Blockly workspace, wires up
+ * the full compiler pipeline (code generation → AST → validation →
+ * optimisation → display), and manages workspace persistence via localStorage.
+ *
+ * ## Compiler Pipeline (executed on every workspace change)
+ *
+ * ```
+ * ┌──────────────────────────┐
+ * │   Blockly Workspace      │
+ * └──────────┬───────────────┘
+ *            │
+ *   ┌────────▼────────┐   ┌──────────────────┐
+ *   │ generator.ts    │   │ ast-builder.ts   │
+ *   │ (Raw SQL)       │   │ (AST)            │
+ *   └────────┬────────┘   └────────┬─────────┘
+ *            │                     │
+ *            │            ┌────────▼─────────┐
+ *            │            │ validator.ts     │
+ *            │            │ (block warnings) │
+ *            │            └────────┬─────────┘
+ *            │            ┌────────▼─────────┐
+ *            │            │ optimizer.ts     │
+ *            │            │ (simplify AST)   │
+ *            │            └────────┬─────────┘
+ *            │            ┌────────▼─────────┐
+ *            │            │ sql-emitter.ts   │
+ *            │            │ (Optimised SQL)  │
+ *            │            └────────┬─────────┘
+ *   ┌────────▼────────┐  ┌────────▼─────────┐
+ *   │ Original Query  │  │ Optimised Query  │
+ *   │ (left pane)     │  │ (right pane)     │
+ *   └─────────────────┘  └──────────────────┘
+ * ```
+ */
+
 import * as Blockly from 'blockly';
 import { defineBlocks } from './blocks';
 import { generator } from './generator';
@@ -5,11 +43,14 @@ import { buildAST, buildSchema } from './ast-builder';
 import { emitSQL } from './sql-emitter';
 import { validateQuery } from './validator';
 import { optimizeAST } from './optimizer';
+import { BLOCK_QUERY, STORAGE_KEY } from './constants';
 
-// define blocks
+// ── Initialisation ────────────────────────────────────────────────────────
+
+/** Register all custom block definitions before creating the workspace. */
 defineBlocks();
 
-// workspace
+/** The Blockly workspace with a categorised toolbox. */
 const workspace = Blockly.inject('blocklyDiv', {
   toolbox: {
     "kind": "categoryToolbox",
@@ -61,25 +102,45 @@ const workspace = Blockly.inject('blocklyDiv', {
   }
 });
 
-// show code and errors
+// ── DOM References ────────────────────────────────────────────────────────
+
 const codeOutput = document.getElementById('codeOutput');
 const optimizedOutput = document.getElementById('optimizedOutput');
 const errorOutput = document.getElementById('errorOutput');
 
+// ── Workspace Change Handler ──────────────────────────────────────────────
+
+/**
+ * Guard flag to prevent re-entrant calls.
+ * `block.setWarningText()` fires a workspace change event, which would
+ * trigger this handler recursively without this guard.
+ */
 let isValidating = false;
 
-// generate code and auto-save whenever the workspace changes
+/**
+ * Main event handler — runs the full compiler pipeline whenever the
+ * workspace changes (block added, moved, connected, field edited, etc.).
+ *
+ * Steps:
+ * 1. Generate raw SQL via the Blockly string generator (Original Query).
+ * 2. Build the AST from the workspace.
+ * 3. Run the optimiser and emit the optimised SQL (Optimised Query).
+ * 4. Run the validator and attach warnings to offending blocks.
+ * 5. Auto-save the workspace to localStorage (for non-UI events only).
+ *
+ * @param event - The Blockly event that triggered the change.
+ */
 function handleWorkspaceChange(event: Blockly.Events.Abstract) {
   if (isValidating) return;
   
   try {
     isValidating = true;
     try {
-      // 1. Raw string generation
+      // Step 1: Raw string generation (only from sql_query blocks)
       let code = '';
       const topBlocks = workspace.getTopBlocks(true);
       for (const block of topBlocks) {
-        if (block.type === 'sql_query') {
+        if (block.type === BLOCK_QUERY) {
           code += generator.blockToCode(block) + '\n';
         }
       }
@@ -87,31 +148,32 @@ function handleWorkspaceChange(event: Blockly.Events.Abstract) {
       
       if (codeOutput) codeOutput.textContent = code || '-- No query blocks in workspace';
       
-      // 2. AST generation & Validation
+      // Step 2: AST generation
       const ast = buildAST(workspace);
 
-      // 3. Optimization
+      // Step 3: Optimisation
       const optimizedAST = optimizeAST(ast);
       const optimizedCode = emitSQL(optimizedAST);
       if (optimizedOutput) optimizedOutput.textContent = optimizedCode || '-- No query blocks in workspace';
 
+      // Step 4: Validation
       const schema = buildSchema(workspace);
       const issues = validateQuery(ast, schema);
 
-      // Map issues by blockId
+      // Map issues by blockId for O(1) lookup
       const issueMap = new Map<string, string>();
       for (const issue of issues) {
         issueMap.set(issue.blockId, issue.message);
       }
 
-      // Update warnings on all blocks ONLY if they have changed
-      // This prevents unnecessary UI updates and infinite loops
+      // Update warning text on every block (set or clear)
       const allBlocks = workspace.getAllBlocks(false);
       for (const block of allBlocks) {
         const newWarning = issueMap.get(block.id) || null;
         block.setWarningText(newWarning);
       }
 
+      // Update the error output panel
       if (errorOutput) {
         if (issues.length > 0) {
           errorOutput.textContent = `Found ${issues.length} issue(s). Check blocks for warnings.`;
@@ -131,15 +193,17 @@ function handleWorkspaceChange(event: Blockly.Events.Abstract) {
     }
   }
 
-  // Auto-save to localStorage if this is a functional change (not just clicking/scrolling)
+  // Step 5: Auto-save (skip UI-only events like clicking or scrolling)
   if (!event.isUiEvent) {
     const state = Blockly.serialization.workspaces.save(workspace);
-    localStorage.setItem('blockySQL_workspace', JSON.stringify(state));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   }
 }
 
-// Load saved workspace from localStorage
-const savedState = localStorage.getItem('blockySQL_workspace');
+// ── Workspace Restoration ─────────────────────────────────────────────────
+
+/** Restore previously saved workspace state from localStorage, if available. */
+const savedState = localStorage.getItem(STORAGE_KEY);
 if (savedState) {
   try {
     Blockly.serialization.workspaces.load(JSON.parse(savedState), workspace);
@@ -148,5 +212,6 @@ if (savedState) {
   }
 }
 
-// listen to changes
+// ── Event Binding ─────────────────────────────────────────────────────────
+
 workspace.addChangeListener(handleWorkspaceChange);

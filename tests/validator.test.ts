@@ -87,6 +87,17 @@ describe('Phase 6 – Semantic Validation', () => {
 
     const issues = validateQuery([query], schema);
     expect(issues.some(i => i.message.includes('Type mismatch'))).toBe(true);
+
+    // Test comparing TEXT to number
+    query.where = {
+      type: 'BinaryExpression',
+      operator: '=',
+      left: { type: 'Column', table: 'users', column: 'name', alias: null },
+      right: { type: 'Literal', value: 5000 }, // number compared to TEXT
+      blockId: 'b1_text'
+    };
+    const issuesText = validateQuery([query], schema);
+    expect(issuesText.some(i => i.message.includes('TEXT column to a number'))).toBe(true);
     
     // Test comparing Column to Column
     query.where = {

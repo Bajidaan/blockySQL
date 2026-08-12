@@ -1,17 +1,60 @@
-import type { ASTNode, SelectQueryNode } from './ast';
+/**
+ * @module validator
+ *
+ * Performs semantic validation on the SQL AST by walking each
+ * {@link SelectQueryNode} and checking for logical errors that cannot
+ * be caught by Blockly's connection-type system alone.
+ *
+ * Each issue includes the `blockId` of the offending Blockly block so that
+ * `main.ts` can attach a visual warning icon directly to it.
+ *
+ * ## Validation Rules
+ *
+ * | # | Rule | Severity |
+ * |---|------|----------|
+ * | 1 | Missing FROM clause | warning |
+ * | 2 | Unresolved column reference (table or column not in schema) | error |
+ * | 3 | Type mismatch in comparisons (e.g. INTEGER vs TEXT) | warning |
+ * | 4 | Aggregation without GROUP BY | warning |
+ * | 5 | Non-aggregated column in a grouped query | error |
+ */
+
+import type { ASTNode, SelectQueryNode, ColumnNode } from './ast';
 import type { Schema } from './ast-builder';
 
+/**
+ * A single validation issue found during semantic analysis.
+ *
+ * @property blockId  - The Blockly block ID where the issue originates.
+ * @property message  - Human-readable description of the problem.
+ * @property severity - `'error'` for logical errors, `'warning'` for suspicious patterns.
+ */
 export interface ValidationIssue {
   blockId: string;
   message: string;
   severity: 'error' | 'warning';
 }
 
+/**
+ * Validate an array of query ASTs against the given schema.
+ *
+ * @param ast    - Array of {@link SelectQueryNode} trees produced by `buildAST`.
+ * @param schema - Table/column metadata produced by `buildSchema`.
+ * @returns An array of {@link ValidationIssue} objects (empty if no problems found).
+ *
+ * @example
+ * ```ts
+ * const ast = buildAST(workspace);
+ * const schema = buildSchema(workspace);
+ * const issues = validateQuery(ast, schema);
+ * // issues: [{ blockId: "abc123", message: "Column 'foo' does not exist…", severity: "error" }]
+ * ```
+ */
 export function validateQuery(ast: SelectQueryNode[], schema: Schema): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
   for (const query of ast) {
-    // Missing FROM: SELECT without a FROM clause -> warning
+    // Rule 1: Missing FROM clause
     if (query.from.length === 0 && query.blockId) {
       issues.push({
         blockId: query.blockId,
@@ -20,7 +63,7 @@ export function validateQuery(ast: SelectQueryNode[], schema: Schema): Validatio
       });
     }
 
-    // Build a set of available tables/aliases in this query
+    // Build a lookup of table names/aliases available in this query scope
     const availableTables = new Map<string, string>();
     for (const f of query.from) {
       availableTables.set(f.alias || f.name, f.name);
@@ -35,6 +78,15 @@ export function validateQuery(ast: SelectQueryNode[], schema: Schema): Validatio
   return issues;
 }
 
+/**
+ * Recursively walk an AST subtree, applying validation rules to each node.
+ *
+ * @param node            - The current AST node being inspected.
+ * @param query           - The root {@link SelectQueryNode} (for aggregation context).
+ * @param schema          - Table/column metadata from the workspace schema definitions.
+ * @param availableTables - Map of `alias|name → actualTableName` for scope resolution.
+ * @param issues          - Accumulator array; issues are pushed here as they are found.
+ */
 function walkAST(
   node: ASTNode,
   query: SelectQueryNode,
@@ -42,8 +94,8 @@ function walkAST(
   availableTables: Map<string, string>,
   issues: ValidationIssue[]
 ) {
+  // ── Rule 2: Unresolved column reference ────────────────────────────────
   if (node.type === 'Column') {
-    // Unresolved column reference
     if (node.table && node.column) {
       const actualTableName = availableTables.get(node.table);
       if (!actualTableName) {
@@ -69,36 +121,16 @@ function walkAST(
     }
   }
 
+  // ── Rule 3: Type mismatch in comparisons ───────────────────────────────
   if (node.type === 'BinaryExpression') {
-    // Type mismatch in comparisons
+    // Column vs Literal
     if (node.left.type === 'Column' && node.right.type === 'Literal') {
-      const type = getColumnType(node.left, schema, availableTables);
-      if (type === 'INTEGER' || type === 'REAL') {
-        if (typeof node.right.value === 'string' && !node.right.value.match(/^['"]?\d+(\.\d+)?['"]?$/)) {
-          if (node.blockId) {
-            issues.push({
-              blockId: node.blockId,
-              message: `Type mismatch: comparing numeric column to a string.`,
-              severity: 'warning'
-            });
-          }
-        }
-      }
+      checkColumnLiteralMismatch(node.left, node.right, node.blockId, schema, availableTables, issues);
     }
     if (node.right.type === 'Column' && node.left.type === 'Literal') {
-      const type = getColumnType(node.right, schema, availableTables);
-      if (type === 'INTEGER' || type === 'REAL') {
-        if (typeof node.left.value === 'string' && !node.left.value.match(/^['"]?\d+(\.\d+)?['"]?$/)) {
-          if (node.blockId) {
-            issues.push({
-              blockId: node.blockId,
-              message: `Type mismatch: comparing numeric column to a string.`,
-              severity: 'warning'
-            });
-          }
-        }
-      }
+      checkColumnLiteralMismatch(node.right, node.left, node.blockId, schema, availableTables, issues);
     }
+    // Column vs Column
     if (node.left.type === 'Column' && node.right.type === 'Column') {
       const typeLeft = getColumnType(node.left, schema, availableTables);
       const typeRight = getColumnType(node.right, schema, availableTables);
@@ -114,6 +146,7 @@ function walkAST(
     }
   }
 
+  // ── Recurse into child nodes ───────────────────────────────────────────
   switch (node.type) {
     case 'SelectQuery':
       for (const c of node.columns) walkAST(c, query, schema, availableTables, issues);
@@ -123,6 +156,7 @@ function walkAST(
       if (node.having) walkAST(node.having, query, schema, availableTables, issues);
       for (const o of node.orderBy) walkAST(o.expr, query, schema, availableTables, issues);
 
+      // Rules 4 & 5: Aggregation checks (only at query level)
       checkAggregationRules(node, issues);
       break;
     case 'BinaryExpression':
@@ -139,7 +173,55 @@ function walkAST(
   }
 }
 
-function getColumnType(col: import('./ast').ColumnNode, schema: Schema, availableTables: Map<string, string>): string | null {
+/**
+ * Check if a column-to-literal comparison has a type mismatch.
+ * E.g. comparing an INTEGER column to a non-numeric string literal.
+ */
+function checkColumnLiteralMismatch(
+  col: ColumnNode,
+  lit: import('./ast').LiteralNode,
+  blockId: string | undefined,
+  schema: Schema,
+  availableTables: Map<string, string>,
+  issues: ValidationIssue[]
+) {
+  const type = getColumnType(col, schema, availableTables);
+  if (type === 'INTEGER' || type === 'REAL') {
+    if (typeof lit.value === 'string' && !lit.value.match(/^['"]?\d+(\.\d+)?['"]?$/)) {
+      if (blockId) {
+        issues.push({
+          blockId,
+          message: `Type mismatch: comparing numeric column to a string.`,
+          severity: 'warning'
+        });
+      }
+    }
+  } else if (type === 'TEXT') {
+    if (typeof lit.value === 'number') {
+      if (blockId) {
+        issues.push({
+          blockId,
+          message: `Type mismatch: comparing TEXT column to a number.`,
+          severity: 'warning'
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Look up the declared data type of a column from the schema.
+ *
+ * @param col             - The column node to look up.
+ * @param schema          - The workspace schema.
+ * @param availableTables - Alias-to-name mapping for scope resolution.
+ * @returns The column type string (e.g. `'INTEGER'`, `'TEXT'`), or `null` if not found.
+ */
+function getColumnType(
+  col: ColumnNode,
+  schema: Schema,
+  availableTables: Map<string, string>
+): string | null {
   if (!col.table) return null;
   const actualTableName = availableTables.get(col.table);
   if (!actualTableName) return null;
@@ -150,10 +232,19 @@ function getColumnType(col: import('./ast').ColumnNode, schema: Schema, availabl
   return colDef.type;
 }
 
+/**
+ * Check aggregation-related semantic rules (Rules 4 and 5).
+ *
+ * - **Rule 4**: Mixing aggregates and raw columns without GROUP BY.
+ * - **Rule 5**: Selecting a column that isn't in the GROUP BY clause.
+ *
+ * @param query  - The {@link SelectQueryNode} to analyse.
+ * @param issues - Accumulator array for found issues.
+ */
 function checkAggregationRules(query: SelectQueryNode, issues: ValidationIssue[]) {
   let hasAggregate = false;
   let hasRawColumn = false;
-  const rawColumnNodes: import('./ast').ColumnNode[] = [];
+  const rawColumnNodes: ColumnNode[] = [];
 
   for (const c of query.columns) {
     if (c.type === 'Aggregate') {
@@ -166,7 +257,7 @@ function checkAggregationRules(query: SelectQueryNode, issues: ValidationIssue[]
     }
   }
 
-  // Aggregation without GROUP BY 
+  // Rule 4: Aggregation without GROUP BY
   if (hasAggregate && query.groupBy.length === 0 && hasRawColumn) {
     for (const c of query.columns) {
       if (c.type === 'Aggregate' && c.blockId) {
@@ -179,7 +270,7 @@ function checkAggregationRules(query: SelectQueryNode, issues: ValidationIssue[]
     }
   }
 
-  // Non-aggregated column in grouped query
+  // Rule 5: Non-aggregated column in grouped query
   if (query.groupBy.length > 0 && hasRawColumn) {
     const groupedCols = new Set<string>();
     for (const g of query.groupBy) {
