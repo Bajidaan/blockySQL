@@ -1,10 +1,40 @@
+/**
+ * @module sql-emitter
+ *
+ * Converts an array of AST {@link SelectQueryNode} trees into a formatted
+ * SQL string.  This is the final stage of the compiler pipeline:
+ *
+ * ```
+ * Blockly Workspace → AST (ast-builder) → Optimizer → SQL String (this module)
+ * ```
+ *
+ * @example
+ * ```ts
+ * const ast = buildAST(workspace);
+ * const sql = emitSQL(ast);
+ * // "SELECT employees.name\nFROM employees\nWHERE salary > 50000;"
+ * ```
+ */
+
 import type { ASTNode, SelectQueryNode, TableNode } from './ast';
 
+/**
+ * Convert an array of AST root nodes into a single SQL string.
+ * Multiple queries are separated by blank lines.
+ *
+ * @param nodes - Array of AST nodes (typically {@link SelectQueryNode} trees).
+ * @returns The formatted SQL string, or a placeholder comment if no nodes.
+ */
 export function emitSQL(nodes: ASTNode[]): string {
   if (nodes.length === 0) return '-- No query blocks in workspace';
   return nodes.map(node => emitNode(node)).join('\n\n');
 }
 
+/**
+ * Dispatch a single AST node to the appropriate emitter.
+ * Top-level {@link SelectQueryNode}s get full query formatting;
+ * all other nodes are treated as expressions.
+ */
 function emitNode(node: ASTNode): string {
   if (node.type === 'SelectQuery') {
     return emitSelectQuery(node);
@@ -12,6 +42,13 @@ function emitNode(node: ASTNode): string {
   return emitExpr(node);
 }
 
+/**
+ * Emit a complete SELECT statement from a {@link SelectQueryNode}.
+ * Clauses are only included when the corresponding AST field is non-empty/non-null.
+ *
+ * @param node - The SELECT query AST node.
+ * @returns A complete SQL SELECT statement ending with `;`.
+ */
 function emitSelectQuery(node: SelectQueryNode): string {
   let sql = `SELECT ${node.distinct ? 'DISTINCT ' : ''}`;
   
@@ -52,6 +89,12 @@ function emitSelectQuery(node: SelectQueryNode): string {
   return sql + ';';
 }
 
+/**
+ * Emit a table reference, including its alias when present.
+ *
+ * @param node - A {@link TableNode}.
+ * @returns `"tableName"` or `"tableName AS alias"`.
+ */
 function emitTable(node: TableNode): string {
   if (node.alias) {
     return `${node.name} AS ${node.alias}`;
@@ -59,6 +102,14 @@ function emitTable(node: TableNode): string {
   return node.name;
 }
 
+/**
+ * Recursively emit any expression node as a SQL fragment.
+ * Handles columns, literals, binary/unary expressions, and aggregates.
+ * Logical operators (`AND`/`OR`) are wrapped in parentheses for clarity.
+ *
+ * @param node - Any {@link ASTNode}.
+ * @returns The SQL fragment string.
+ */
 function emitExpr(node: ASTNode): string {
   switch (node.type) {
     case 'Column':

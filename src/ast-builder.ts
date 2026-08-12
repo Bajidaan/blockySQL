@@ -1,3 +1,19 @@
+/**
+ * @module ast-builder
+ *
+ * Walks the live Blockly workspace and constructs a typed AST
+ * (see {@link ast.ts}) that represents the user's SQL query.
+ *
+ * This is the first stage of the compiler pipeline:
+ * ```
+ * **Blockly Workspace → AST** → Validator → Optimizer → SQL Emitter
+ * ```
+ *
+ * Also provides {@link buildSchema} to extract table/column metadata
+ * from `sql_define_table` / `sql_define_column` blocks, which the
+ * validator uses for semantic checks.
+ */
+
 import * as Blockly from 'blockly';
 import type {
   ASTNode,
@@ -7,20 +23,71 @@ import type {
   OrderByNode,
   LimitNode
 } from './ast';
+import {
+  BLOCK_QUERY,
+  BLOCK_DEFINE_TABLE,
+  BLOCK_DEFINE_COLUMN,
+  BLOCK_ALL_COLUMNS,
+  BLOCK_SELECT_ITEM,
+  BLOCK_FROM_TABLE,
+  BLOCK_JOIN,
+  BLOCK_WHERE,
+  BLOCK_GROUP_BY,
+  BLOCK_HAVING,
+  BLOCK_ORDER_BY,
+  BLOCK_LIMIT,
+  BLOCK_COLUMN_EXPR,
+  BLOCK_VALUE,
+  BLOCK_COMPARISON,
+  BLOCK_LOGICAL,
+  BLOCK_NOT,
+  BLOCK_AGG_FUNC,
+  NONE_SENTINEL
+} from './constants';
 
+// ── Schema Types ──────────────────────────────────────────────────────────
+
+/**
+ * Metadata for a single column in the workspace schema.
+ *
+ * @property type - The SQL data type (`'TEXT'`, `'INTEGER'`, `'REAL'`, `'BOOLEAN'`).
+ */
 export interface ColumnSchema {
   type: string;
 }
 
+/**
+ * Metadata for a single table, mapping column names to their schemas.
+ */
 export interface TableSchema {
   columns: Record<string, ColumnSchema>;
 }
 
+/**
+ * The complete workspace schema: a map from table name to its column definitions.
+ * Built from `sql_define_table` / `sql_define_column` blocks.
+ */
 export type Schema = Record<string, TableSchema>;
 
+// ── Schema Extraction ─────────────────────────────────────────────────────
+
+/**
+ * Extract table and column metadata from all `sql_define_table` blocks
+ * in the workspace.  The result is used by the validator for type checking
+ * and column resolution.
+ *
+ * @param workspace - The Blockly workspace to scan.
+ * @returns A {@link Schema} mapping table names to their column definitions.
+ *
+ * @example
+ * ```ts
+ * const schema = buildSchema(workspace);
+ * // { employees: { columns: { id: { type: 'INTEGER' }, name: { type: 'TEXT' } } } }
+ * ```
+ */
 export function buildSchema(workspace: Blockly.Workspace): Schema {
   const schema: Schema = {};
-  const tableDefs = workspace.getBlocksByType('sql_define_table');
+  const tableDefs = workspace.getBlocksByType(BLOCK_DEFINE_TABLE);
   
   for (const block of tableDefs) {
     const tableName = block.getFieldValue('TABLE_NAME');
@@ -29,7 +96,7 @@ export function buildSchema(workspace: Blockly.Workspace): Schema {
     const tableSchema: TableSchema = { columns: {} };
     let colBlock = block.getInputTargetBlock('COLUMNS');
     while (colBlock) {
-      if (colBlock.type === 'sql_define_column') {
+      if (colBlock.type === BLOCK_DEFINE_COLUMN) {
         const colName = colBlock.getFieldValue('COL_NAME');
         const colType = colBlock.getFieldValue('COL_TYPE');
         if (colName) {
@@ -43,12 +110,27 @@ export function buildSchema(workspace: Blockly.Workspace): Schema {
   return schema;
 }
 
+// ── AST Construction ──────────────────────────────────────────────────────
+
+/**
+ * Walk the Blockly workspace and build an AST for every `sql_query` block.
+ * Non-query top-level blocks (e.g. floating schema definitions) are ignored.
+ *
+ * @param workspace - The Blockly workspace to scan.
+ * @returns An array of {@link SelectQueryNode} AST roots — one per `sql_query` block.
+ *
+ * @example
+ * ```ts
+ * const ast = buildAST(workspace);
+ * const sql = emitSQL(ast); // full SQL string
+ * ```
+ */
 export function buildAST(workspace: Blockly.Workspace): SelectQueryNode[] {
   const topBlocks = workspace.getTopBlocks(true);
   const queries: SelectQueryNode[] = [];
 
   for (const block of topBlocks) {
-    if (block.type === 'sql_query') {
+    if (block.type === BLOCK_QUERY) {
       queries.push(buildQueryNode(block));
     }
   }
@@ -56,10 +138,17 @@ export function buildAST(workspace: Blockly.Workspace): SelectQueryNode[] {
   return queries;
 }
 
+/**
+ * Build a {@link SelectQueryNode} from a single `sql_query` block,
+ * including all its nested clause blocks (FROM, WHERE, GROUP BY, etc.).
+ *
+ * @param block - A Blockly block of type `sql_query`.
+ * @returns The fully populated AST node.
+ */
 function buildQueryNode(block: Blockly.Block): SelectQueryNode {
   const distinct = block.getFieldValue('DISTINCT') === 'TRUE';
   
-  // COLUMNS
+  // ── SELECT columns ─────────────────────────────────────────────────
   const columns: ASTNode[] = [];
   let colBlock = block.getInputTargetBlock('COLUMNS');
   while (colBlock) {
@@ -68,14 +157,14 @@ function buildQueryNode(block: Blockly.Block): SelectQueryNode {
     colBlock = colBlock.getNextBlock();
   }
 
-  // FROM & JOINS
+  // ── FROM tables & JOINs ────────────────────────────────────────────
   const from: TableNode[] = [];
   const joins: JoinNode[] = [];
   let fromBlock = block.getInputTargetBlock('FROM');
   while (fromBlock) {
-    if (fromBlock.type === 'sql_from_table') {
+    if (fromBlock.type === BLOCK_FROM_TABLE) {
       const name = fromBlock.getFieldValue('TABLE');
-      if (name && name !== 'NONE') {
+      if (name && name !== NONE_SENTINEL) {
         from.push({
           type: 'Table',
           name,
@@ -83,9 +172,9 @@ function buildQueryNode(block: Blockly.Block): SelectQueryNode {
           blockId: fromBlock.id
         });
       }
-    } else if (fromBlock.type === 'sql_join') {
+    } else if (fromBlock.type === BLOCK_JOIN) {
       const name = fromBlock.getFieldValue('TABLE');
-      if (name && name !== 'NONE') {
+      if (name && name !== NONE_SENTINEL) {
         joins.push({
           type: 'Join',
           joinType: fromBlock.getFieldValue('JOIN_TYPE'),
@@ -103,36 +192,38 @@ function buildQueryNode(block: Blockly.Block): SelectQueryNode {
     fromBlock = fromBlock.getNextBlock();
   }
 
-  // WHERE
+  // ── WHERE ──────────────────────────────────────────────────────────
   let where: ASTNode | null = null;
   const whereClauseBlock = block.getInputTargetBlock('WHERE');
-  if (whereClauseBlock && whereClauseBlock.type === 'sql_where') {
-    where = buildExprNode(whereClauseBlock.getInputTargetBlock('CONDITION')) || { type: 'Literal', value: true, blockId: whereClauseBlock.id };
+  if (whereClauseBlock && whereClauseBlock.type === BLOCK_WHERE) {
+    where = buildExprNode(whereClauseBlock.getInputTargetBlock('CONDITION'))
+      || { type: 'Literal', value: true, blockId: whereClauseBlock.id };
   }
 
-  // GROUP BY
+  // ── GROUP BY ───────────────────────────────────────────────────────
   const groupBy: ASTNode[] = [];
   let groupBlock = block.getInputTargetBlock('GROUP_BY');
   while (groupBlock) {
-    if (groupBlock.type === 'sql_group_by') {
+    if (groupBlock.type === BLOCK_GROUP_BY) {
       const expr = buildExprNode(groupBlock.getInputTargetBlock('EXPR'));
       if (expr) groupBy.push(expr);
     }
     groupBlock = groupBlock.getNextBlock();
   }
 
-  // HAVING
+  // ── HAVING ─────────────────────────────────────────────────────────
   let having: ASTNode | null = null;
   const havingClauseBlock = block.getInputTargetBlock('HAVING');
-  if (havingClauseBlock && havingClauseBlock.type === 'sql_having') {
-    having = buildExprNode(havingClauseBlock.getInputTargetBlock('CONDITION')) || { type: 'Literal', value: true, blockId: havingClauseBlock.id };
+  if (havingClauseBlock && havingClauseBlock.type === BLOCK_HAVING) {
+    having = buildExprNode(havingClauseBlock.getInputTargetBlock('CONDITION'))
+      || { type: 'Literal', value: true, blockId: havingClauseBlock.id };
   }
 
-  // ORDER BY
+  // ── ORDER BY ───────────────────────────────────────────────────────
   const orderBy: OrderByNode[] = [];
   let orderBlock = block.getInputTargetBlock('ORDER_BY');
   while (orderBlock) {
-    if (orderBlock.type === 'sql_order_by') {
+    if (orderBlock.type === BLOCK_ORDER_BY) {
       const expr = buildExprNode(orderBlock.getInputTargetBlock('EXPR'));
       if (expr) {
         orderBy.push({
@@ -146,10 +237,10 @@ function buildQueryNode(block: Blockly.Block): SelectQueryNode {
     orderBlock = orderBlock.getNextBlock();
   }
 
-  // LIMIT
+  // ── LIMIT ──────────────────────────────────────────────────────────
   let limit: LimitNode | null = null;
   const limitClauseBlock = block.getInputTargetBlock('LIMIT');
-  if (limitClauseBlock && limitClauseBlock.type === 'sql_limit') {
+  if (limitClauseBlock && limitClauseBlock.type === BLOCK_LIMIT) {
     const expr = buildExprNode(limitClauseBlock.getInputTargetBlock('NUM'));
     if (expr && expr.type === 'Literal' && typeof expr.value === 'number') {
       limit = { type: 'Limit', value: expr.value, blockId: limitClauseBlock.id };
@@ -174,11 +265,18 @@ function buildQueryNode(block: Blockly.Block): SelectQueryNode {
   };
 }
 
+/**
+ * Build an AST node for a single item in the SELECT list.
+ * Handles `sql_all_columns` (`*`) and `sql_select_item` (expression + alias).
+ *
+ * @param block - A Blockly block in the COLUMNS statement input.
+ * @returns An AST node, or `null` if the block type is unrecognised.
+ */
 function buildSelectNode(block: Blockly.Block): ASTNode | null {
-  if (block.type === 'sql_all_columns') {
+  if (block.type === BLOCK_ALL_COLUMNS) {
     return { type: 'Literal', value: '*', blockId: block.id };
   }
-  if (block.type === 'sql_select_item') {
+  if (block.type === BLOCK_SELECT_ITEM) {
     const exprBlock = block.getInputTargetBlock('EXPR');
     const expr = buildExprNode(exprBlock) || { type: 'Literal', value: null, blockId: block.id };
     const alias = block.getFieldValue('ALIAS');
@@ -194,13 +292,25 @@ function buildSelectNode(block: Blockly.Block): ASTNode | null {
   return null;
 }
 
+/**
+ * Build an AST expression node from any expression-type Blockly block.
+ * Dispatches based on block type to create the appropriate AST node.
+ *
+ * Handles: `sql_column_expr`, `sql_value`, `sql_comparison`, `sql_logical`,
+ * `sql_not`, and `sql_agg_func`.
+ *
+ * @param block - A Blockly block (or `null` for an empty input).
+ * @returns An AST node, or `null` if the block is null/unrecognised.
+ */
 function buildExprNode(block: Blockly.Block | null): ASTNode | null {
   if (!block) return null;
 
-  if (block.type === 'sql_column_expr') {
+  if (block.type === BLOCK_COLUMN_EXPR) {
     const table = block.getFieldValue('TABLE');
     const column = block.getFieldValue('COLUMN');
-    if (!table || table === 'NONE' || !column || column === 'NONE') return { type: 'Literal', value: null, blockId: block.id };
+    if (!table || table === NONE_SENTINEL || !column || column === NONE_SENTINEL) {
+      return { type: 'Literal', value: null, blockId: block.id };
+    }
     return {
       type: 'Column',
       table,
@@ -210,7 +320,7 @@ function buildExprNode(block: Blockly.Block | null): ASTNode | null {
     };
   }
 
-  if (block.type === 'sql_value') {
+  if (block.type === BLOCK_VALUE) {
     const val = block.getFieldValue('VALUE');
     const num = Number(val);
     if (!isNaN(num) && val.trim() !== '') return { type: 'Literal', value: num, blockId: block.id };
@@ -226,7 +336,7 @@ function buildExprNode(block: Blockly.Block | null): ASTNode | null {
     return { type: 'Literal', value: `'${val}'`, blockId: block.id };
   }
 
-  if (block.type === 'sql_comparison' || block.type === 'sql_logical') {
+  if (block.type === BLOCK_COMPARISON || block.type === BLOCK_LOGICAL) {
     return {
       type: 'BinaryExpression',
       operator: block.getFieldValue('OP'),
@@ -236,7 +346,7 @@ function buildExprNode(block: Blockly.Block | null): ASTNode | null {
     };
   }
 
-  if (block.type === 'sql_not') {
+  if (block.type === BLOCK_NOT) {
     return {
       type: 'UnaryExpression',
       operator: 'NOT',
@@ -245,7 +355,7 @@ function buildExprNode(block: Blockly.Block | null): ASTNode | null {
     };
   }
 
-  if (block.type === 'sql_agg_func') {
+  if (block.type === BLOCK_AGG_FUNC) {
     return {
       type: 'Aggregate',
       func: block.getFieldValue('FUNC'),
